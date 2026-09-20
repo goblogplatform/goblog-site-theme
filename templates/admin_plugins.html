@@ -2,24 +2,25 @@
 <div class="container">
     {{ template "admin_nav.html" . }}
     <h1>Plugins</h1>
-    <p class="text-muted">Browse the <a href="https://www.goblog.live/plugins" target="_blank" rel="noopener">plugin directory</a> and install plugins with one click. Directory plugins are dynamic: they can add settings and head/footer HTML. Plugins that add pages or background jobs ship compiled into goblog.</p>
+    <p class="text-muted">Browse the <a href="https://www.goblog.live/plugins" target="_blank" rel="noopener">plugin directory</a> and install plugins with one click. Directory plugins run sandboxed in WebAssembly and can add pages, background jobs, settings and head/footer HTML. They can only reach the hosts they declare.</p>
 
     <div id="plugins-error" class="alert alert-danger" role="alert" hidden></div>
     <div id="plugins-disabled" class="alert alert-warning" role="alert" hidden>
-        Installing plugins needs <code>ENABLE_DYNAMIC_PLUGINS=true</code> and a writable, persisted <code>plugins/dynamic/</code> directory (bind-mount it with Docker). See the README under <em>Dynamic plugins</em>. You can still browse the directory.
+        WebAssembly plugins are disabled (<code>ENABLE_WASM_PLUGINS=false</code>). Remove that setting (WASM is on by default) to install plugins from the directory. You can still browse it.
     </div>
     <div id="plugins-index-error" class="alert alert-warning" role="alert" hidden>
         <span id="plugins-index-error-text"></span> — directory URL is set under <a href="/admin/settings">Settings → plugin_directory_url</a>.
         <button type="button" class="btn btn-sm btn-outline-secondary ms-2" onclick="refreshDirectory()">Refresh</button>
     </div>
     <div id="plugins-trust" class="alert alert-info alert-dismissible" role="alert">
-        Plugins run as Go code inside goblog with the same access it has. Install only plugins from sources you trust.
+        Directory plugins run sandboxed in WebAssembly, with network access limited to the hosts they declare. Built-in and legacy Go plugins run as ordinary code inside goblog with the same access it has. Plugins add HTML to every page (head/footer hooks) and own their pages; install only plugins you trust.
         <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
     </div>
 
     <ul class="nav nav-tabs mb-3" role="tablist">
         <li class="nav-item"><button class="nav-link active" id="tab-installed" data-bs-toggle="tab" data-bs-target="#pane-installed" type="button" role="tab">Installed</button></li>
         <li class="nav-item"><button class="nav-link" id="tab-browse" data-bs-toggle="tab" data-bs-target="#pane-browse" type="button" role="tab">Browse</button></li>
+        <li class="nav-item" id="tab-directory-item" hidden><button class="nav-link" id="tab-directory" data-bs-toggle="tab" data-bs-target="#pane-directory" type="button" role="tab">Directory</button></li>
     </ul>
     <div class="tab-content">
         <div class="tab-pane fade show active" id="pane-installed" role="tabpanel">
@@ -42,12 +43,32 @@
             </div>
             <div id="browse-cards" class="row g-3"><div class="col-12 text-muted">Loading…</div></div>
         </div>
+        <div class="tab-pane fade" id="pane-directory" role="tabpanel">
+            <p class="text-muted">This site hosts the plugin directory. Repositories submitted at <a href="/plugins/submit">/plugins/submit</a> wait here for approval; everything approved is published in <a href="/plugins/index.json">index.json</a>.</p>
+            <form class="row g-2 mb-4" id="directory-add-form">
+                <div class="col-md-9"><input type="text" id="directory-add-repo" class="form-control" placeholder="https://github.com/owner/goblog-plugin-name" required></div>
+                <div class="col-md-3 d-grid"><button type="submit" class="btn btn-primary" id="directory-add-btn">Add repository</button></div>
+                <div class="col-12 small text-danger" id="directory-add-error"></div>
+            </form>
+            <h2 class="h5">Pending review</h2>
+            <div id="directory-pending" class="row g-3 mb-4"><div class="col-12 text-muted">Loading…</div></div>
+            <h2 class="h5">Listed</h2>
+            <table class="table align-middle">
+                <thead><tr><th>Plugin</th><th>Repository</th><th>Version</th><th>Stars</th><th>Last build</th><th></th></tr></thead>
+                <tbody id="directory-approved"><tr><td colspan="6" class="text-muted">Loading…</td></tr></tbody>
+            </table>
+            <h2 class="h5">Rejected</h2>
+            <table class="table align-middle">
+                <thead><tr><th>Repository</th><th>Reason</th><th>Decided</th><th></th></tr></thead>
+                <tbody id="directory-rejected"><tr><td colspan="4" class="text-muted">None.</td></tr></tbody>
+            </table>
+        </div>
     </div>
 </div>
 
 <script>
 (function () {
-  var state = { status: null, dynamicEnabled: false, dirWritable: false };
+  var state = { status: null, wasmEnabled: false, dirWritable: false };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (ch) {
@@ -86,6 +107,35 @@
     return /^[a-z0-9-]+$/.test(n || "") ? n : null;
   }
 
+  // hostNote flags an allowed_hosts entry that is broader than one named
+  // host: "*" (anything), another glob pattern, or an address on this
+  // machine or its local network, which a sandboxed plugin should rarely
+  // need. Mirrors plugins/directory's hostNote.
+  function hostNote(h) {
+    h = String(h == null ? "" : h).toLowerCase();
+    if (h === "*") { return "any host"; }
+    if (h.indexOf("*") !== -1) { return "wildcard"; }
+    if (h === "localhost" || h === "::1" || h === "0.0.0.0" || /^(127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)/.test(h)) { return "local network"; }
+    return "";
+  }
+
+  // runtimeBadge labels an installed row by how the plugin actually runs:
+  // sandboxed wasm, a locally-dropped Yaegi .go file, or compiled into goblog.
+  function runtimeBadge(p) {
+    var badge;
+    if (p.runtime === "wasm") { badge = '<span class="badge text-bg-secondary">wasm</span>'; }
+    else if (p.runtime === "go") { badge = '<span class="badge text-bg-secondary">go (local)</span>'; }
+    else if (p.runtime !== "builtin" && p.dynamic) { badge = '<span class="badge text-bg-secondary">dynamic</span>'; } // runtime unknown: an older goblog
+    else { badge = '<span class="badge text-bg-light">built-in</span>'; }
+    // health comes from the plugin's runtime: "busy" while a call holds the
+    // instance, "closed" after a timeout or exit until it is re-created.
+    if (p.health && p.health !== "ok") {
+      var title = p.health === "busy" ? "A call is holding the plugin; page hooks are skipped until it finishes" : "The instance was closed (timeout or exit) and will be re-created on its next call";
+      badge += ' <span class="badge text-bg-warning" title="' + title + '">' + esc(p.health) + '</span>';
+    }
+    return badge;
+  }
+
   function renderInstalled(st) {
     var rows = st.installed.map(function (p) {
       var actions = "";
@@ -99,7 +149,7 @@
       return '<tr id="installed-' + esc(p.name) + '">' +
         '<td><strong>' + esc(p.display_name) + '</strong><br><small class="text-muted">' + esc(p.name) + '</small></td>' +
         '<td>v' + esc(p.version) + '</td>' +
-        '<td>' + (p.dynamic ? '<span class="badge text-bg-secondary">dynamic</span>' : '<span class="badge text-bg-light">built-in</span>') + '</td>' +
+        '<td>' + runtimeBadge(p) + '</td>' +
         '<td><div class="form-check form-switch"><input class="form-check-input" type="checkbox" data-toggle-enabled data-name="' + esc(p.name) + '" aria-label="Enable ' + esc(p.display_name) + '" ' + (p.enabled ? "checked" : "") + '></div></td>' +
         '<td class="text-end">' + actions + '<div class="small text-danger row-error"></div></td></tr>';
     });
@@ -108,17 +158,23 @@
 
   function renderBrowse(list) {
     var cards = list.map(function (p) {
-      var disabled = !state.dynamicEnabled || !state.dirWritable || !p.compatible;
-      var reason = !state.dynamicEnabled ? "dynamic plugins are disabled" : (!state.dirWritable ? "plugins/dynamic/ is not writable" : (p.reason || ""));
+      var disabled = !state.wasmEnabled || !state.dirWritable || !p.compatible;
+      var reason = !state.wasmEnabled ? "WebAssembly plugins are disabled" : (!state.dirWritable ? "plugins/wasm/ is not writable" : (p.reason || ""));
       var source = httpURL(p.source_url);
       var sourceLink = source ? '<a href="' + esc(source) + '" target="_blank" rel="noopener" class="me-2">Source</a>' : '';
       var dirName = safeName(p.name);
       var dirLink = dirName ? '<a href="https://www.goblog.live/plugins/' + esc(dirName) + '" target="_blank" rel="noopener">Directory page</a>' : '';
       var minVer = p.min_goblog_version ? ' · requires goblog ≥ ' + esc(p.min_goblog_version) : '';
+      var hosts = (p.allowed_hosts || []).map(function (h) {
+        var note = hostNote(h);
+        return esc(h) + (note ? ' <span class="badge text-bg-warning">' + esc(note) + '</span>' : '');
+      }).join(", ");
+      var talksTo = hosts ? "Talks to: " + hosts : "No network access";
       return '<div class="col-md-6"><div class="card h-100"><div class="card-body">' +
         '<h5 class="card-title mb-1">' + esc(p.display_name) + ' <small class="text-muted">v' + esc(p.version) + '</small></h5>' +
         '<p class="mb-1 small text-muted">by ' + esc(p.author) + ' · ★ ' + esc(p.stars) + ' · ' + esc(p.license) + minVer + '</p>' +
         '<p class="card-text">' + esc(p.description) + '</p>' +
+        '<p class="small text-muted mb-1">' + talksTo + '</p>' +
         sourceLink + dirLink +
         '</div><div class="card-footer d-flex justify-content-between align-items-center">' +
         '<span class="small text-muted">' + esc(reason) + '</span>' +
@@ -130,13 +186,13 @@
 
   function loadStatus() {
     return api("GET", "/api/v1/plugins/status").then(function (st) {
-      state.status = st; state.dynamicEnabled = st.dynamic_enabled; state.dirWritable = st.dir_writable;
+      state.status = st; state.wasmEnabled = st.wasm_enabled; state.dirWritable = st.dir_writable;
       var disabledEl = document.getElementById("plugins-disabled");
-      if (!st.dynamic_enabled) {
-        disabledEl.innerHTML = 'Installing plugins needs <code>ENABLE_DYNAMIC_PLUGINS=true</code> and a writable, persisted <code>plugins/dynamic/</code> directory (bind-mount it with Docker). See the README under <em>Dynamic plugins</em>. You can still browse the directory.';
+      if (!st.wasm_enabled) {
+        disabledEl.innerHTML = 'WebAssembly plugins are disabled (<code>ENABLE_WASM_PLUGINS=false</code>). Remove that setting (WASM is on by default) to install plugins from the directory. You can still browse it.';
         disabledEl.hidden = false;
       } else if (!st.dir_writable) {
-        disabledEl.innerHTML = 'Dynamic plugins are enabled but <code>plugins/dynamic/</code> is not writable: ' + esc(st.dir_error || "") + '. Fix the directory permissions (or the Docker bind mount) to install plugins.';
+        disabledEl.innerHTML = '<code>plugins/wasm/</code> is not writable: ' + esc(st.dir_error || "") + '. Fix the directory permissions (or the Docker bind mount) to install plugins.';
         disabledEl.hidden = false;
       } else {
         disabledEl.hidden = true;
@@ -145,6 +201,8 @@
       ie.hidden = !st.index_error;
       document.getElementById("plugins-index-error-text").textContent = st.index_error || "";
       renderInstalled(st);
+      document.getElementById("tab-directory-item").hidden = !st.directory_hosted;
+      if (st.directory_hosted) { loadDirectory(); }
       return loadBrowse();
     }).catch(function (e) { showError(e.message); });
   }
@@ -204,6 +262,122 @@
   document.getElementById("browse-cards").addEventListener("click", function (e) {
     var btn = e.target.closest("[data-action]");
     if (btn) { pluginAction(btn.dataset.action, btn.dataset.name, btn); }
+  });
+
+  // ---- Directory tab (only when this site hosts the directory) ----
+  function directoryError(el, msg) { el.textContent = msg || ""; }
+  function fmtDate(s) { return s ? esc(String(s).slice(0, 10)) : ""; }
+  function hostsHTML(hosts) {
+    var parts = (hosts || []).map(function (h) {
+      var note = hostNote(h);
+      return esc(h) + (note ? ' <span class="badge text-bg-warning">' + esc(note) + '</span>' : '');
+    });
+    return parts.length ? "Talks to: " + parts.join(", ") : "No network access";
+  }
+  function pendingCard(r) {
+    var source = httpURL(r.source_url);
+    return '<div class="col-md-6"><div class="card h-100" data-repo-id="' + esc(r.id) + '"><div class="card-body">' +
+      '<h5 class="card-title mb-1">' + esc(r.display_name) + ' <small class="text-muted">' + esc(r.name) + ' v' + esc(r.version) + '</small></h5>' +
+      '<p class="mb-1 small text-muted">by ' + esc(r.author) + ' · ' + esc(r.license) + ' · requires goblog ≥ ' + esc(r.min_goblog_version) + ' · submitted ' + fmtDate(r.submitted_at) + '</p>' +
+      '<p class="small text-muted mb-1">' + hostsHTML(r.allowed_hosts) + '</p>' +
+      (source ? '<a href="' + esc(source) + '" target="_blank" rel="noopener" class="me-2">' + esc(r.repo) + '</a>' : esc(r.repo)) +
+      '<button type="button" class="btn btn-sm btn-link" data-action="readme" data-id="' + esc(r.id) + '">Show README</button>' +
+      '<div class="plugin-readme border rounded p-2 mt-2" data-readme hidden></div>' +
+      '</div><div class="card-footer d-flex justify-content-end gap-2">' +
+      '<button type="button" class="btn btn-sm btn-outline-danger" data-action="reject" data-id="' + esc(r.id) + '">Reject</button>' +
+      '<button type="button" class="btn btn-sm btn-success" data-action="approve" data-id="' + esc(r.id) + '">Approve</button>' +
+      '</div><div class="small text-danger px-3 pb-2 row-error"></div></div></div>';
+  }
+  function approvedRow(r) {
+    var source = httpURL(r.source_url);
+    var build = r.last_error
+      ? '<span class="text-danger" title="' + esc(r.last_error) + '">failed ' + fmtDate(r.last_attempt_at) + '</span><br><small class="text-muted">serving v' + esc(r.version) + ' from ' + fmtDate(r.built_at) + '</small>'
+      : fmtDate(r.built_at);
+    return '<tr data-repo-id="' + esc(r.id) + '">' +
+      '<td><strong>' + esc(r.display_name) + '</strong><br><small class="text-muted">' + esc(r.name) + '</small></td>' +
+      '<td>' + (source ? '<a href="' + esc(source) + '" target="_blank" rel="noopener">' + esc(r.repo) + '</a>' : esc(r.repo)) + '</td>' +
+      '<td>v' + esc(r.version) + '</td><td>★ ' + esc(r.stars) + '</td><td>' + build + '</td>' +
+      '<td class="text-end"><button type="button" class="btn btn-sm btn-outline-secondary me-1" data-action="rebuild" data-id="' + esc(r.id) + '">Rebuild</button>' +
+      '<button type="button" class="btn btn-sm btn-outline-danger" data-action="delist" data-id="' + esc(r.id) + '">Delist</button>' +
+      '<div class="small text-danger row-error"></div></td></tr>';
+  }
+  function rejectedRow(r) {
+    return '<tr data-repo-id="' + esc(r.id) + '"><td>' + esc(r.repo) + '</td><td>' + esc(r.reject_reason) + '</td><td>' + fmtDate(r.decided_at) + '</td>' +
+      '<td class="text-end"><button type="button" class="btn btn-sm btn-success me-1" data-action="approve" data-id="' + esc(r.id) + '">Approve</button>' +
+      '<button type="button" class="btn btn-sm btn-outline-danger" data-action="delist" data-id="' + esc(r.id) + '">Delete</button>' +
+      '<div class="small text-danger row-error"></div></td></tr>';
+  }
+  function renderDirectory(list) {
+    var pending = list.filter(function (r) { return r.status === "pending"; });
+    var approved = list.filter(function (r) { return r.status === "approved"; });
+    var rejected = list.filter(function (r) { return r.status === "rejected"; });
+    document.getElementById("directory-pending").innerHTML = pending.map(pendingCard).join("") || '<div class="col-12 text-muted">Nothing waiting.</div>';
+    document.getElementById("directory-approved").innerHTML = approved.map(approvedRow).join("") || '<tr><td colspan="6" class="text-muted">Nothing listed yet — add a repository above.</td></tr>';
+    document.getElementById("directory-rejected").innerHTML = rejected.map(rejectedRow).join("") || '<tr><td colspan="4" class="text-muted">None.</td></tr>';
+    var badge = pending.length ? ' <span class="badge text-bg-warning">' + pending.length + '</span>' : '';
+    document.getElementById("tab-directory").innerHTML = "Directory" + badge;
+  }
+  window.loadDirectory = function () {
+    return api("GET", "/api/v1/directory/repos").then(renderDirectory).catch(function (e) { showError(e.message); });
+  };
+  function directoryAction(action, id, btn) {
+    var container = btn.closest("tr, .card");
+    var errEl = container ? container.querySelector(".row-error") : null;
+    if (errEl) { errEl.textContent = ""; }
+    if (action === "readme") {
+      var box = container.querySelector("[data-readme]");
+      if (!box.hidden) { box.hidden = true; btn.textContent = "Show README"; return; }
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Loading…';
+      api("GET", "/api/v1/directory/repos/" + encodeURIComponent(id)).then(function (data) {
+        // readme_html is GitHub-rendered and sanitized, the same HTML the
+        // public directory page shows; it is the one field inserted as-is.
+        box.innerHTML = (data.detail && data.detail.readme_html) || "<em>No README.</em>";
+        box.hidden = false; btn.disabled = false; btn.textContent = "Hide README";
+      }).catch(function (e) {
+        btn.disabled = false; btn.textContent = "Show README";
+        if (errEl) { errEl.textContent = e.message; }
+      });
+      return;
+    }
+    var body;
+    if (action === "reject") {
+      var reason = prompt("Reason for rejecting (shown only here):", "");
+      if (reason === null) { return; }
+      body = { reason: reason };
+    }
+    if (action === "delist" && !confirm("Remove this repository from the directory? It can be submitted again later.")) { return; }
+    btn.disabled = true;
+    var label = btn.innerHTML;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> ' + label;
+    function restore() { btn.disabled = false; btn.innerHTML = label; }
+    var p = action === "delist"
+      ? api("DELETE", "/api/v1/directory/repos/" + encodeURIComponent(id))
+      : api("POST", "/api/v1/directory/repos/" + encodeURIComponent(id) + "/" + action, body);
+    p.then(function () { return loadDirectory().then(restore, restore); }, function (e) {
+      restore();
+      if (errEl) { errEl.textContent = e.message; } else { showError(e.message); }
+    });
+  }
+  ["directory-pending", "directory-approved", "directory-rejected"].forEach(function (id) {
+    document.getElementById(id).addEventListener("click", function (e) {
+      var btn = e.target.closest("[data-action]");
+      if (btn) { directoryAction(btn.dataset.action, btn.dataset.id, btn); }
+    });
+  });
+  document.getElementById("directory-add-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var input = document.getElementById("directory-add-repo");
+    var btn = document.getElementById("directory-add-btn");
+    var errEl = document.getElementById("directory-add-error");
+    directoryError(errEl, "");
+    btn.disabled = true;
+    var label = btn.textContent;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Checking…';
+    api("POST", "/api/v1/directory/repos", { repo: input.value.trim() }).then(function () {
+      input.value = "";
+      return loadDirectory();
+    }).catch(function (e) { directoryError(errEl, e.message); }).then(function () { btn.disabled = false; btn.textContent = label; });
   });
 
   loadStatus();
