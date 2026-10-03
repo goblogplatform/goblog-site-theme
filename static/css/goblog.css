@@ -95,3 +95,7 @@ video {
 .search-result .blog-post-meta { color: #7a937a; }
 .search-result .blog-post-meta a { color: #2d5a27; }
 .search-kind { color: #7a937a; font-weight: normal; }
+
+/* The "Powered by goblog" credit is goblog's shared _powered_by partial; its
+   link takes the colour of the footer line around it. */
+.powered-by a { color: inherit; }
