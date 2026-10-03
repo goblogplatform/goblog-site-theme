@@ -99,3 +99,15 @@ video {
 /* The "Powered by goblog" credit is goblog's shared _powered_by partial; its
    link takes the colour of the footer line around it. */
 .powered-by a { color: inherit; }
+
+/* External backlinks table: keep every row to a single line, truncating long referer URLs */
+.backlinks-table .backlinks-referer {
+  width: 100%;
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Admin-only link sections under a post */
+.post-links + .post-links { margin-top: 24px; }
